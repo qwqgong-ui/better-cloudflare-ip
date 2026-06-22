@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,8 +22,38 @@ import (
 
 // 命令行版本的入口
 func main() {
+	stopCPUProfile := startCPUProfileFromEnv()
+	defer stopCPUProfile()
+
 	initLocations()
 	showMenu()
+}
+
+func startCPUProfileFromEnv() func() {
+	profilePath := strings.TrimSpace(os.Getenv("BCFI_CPU_PROFILE"))
+	if profilePath == "" {
+		return func() {}
+	}
+
+	file, err := os.Create(profilePath)
+	if err != nil {
+		fmt.Println("创建 CPU Profile 失败:", err)
+		return func() {}
+	}
+
+	if err := pprof.StartCPUProfile(file); err != nil {
+		file.Close()
+		fmt.Println("启动 CPU Profile 失败:", err)
+		return func() {}
+	}
+
+	fmt.Println("CPU Profile 输出:", profilePath)
+	return func() {
+		pprof.StopCPUProfile()
+		if err := file.Close(); err != nil {
+			fmt.Println("关闭 CPU Profile 失败:", err)
+		}
+	}
 }
 
 // 显示主菜单
@@ -77,11 +108,17 @@ func showMenu() {
 
 // runIPSelector 运行 IP 优选流程
 func runIPSelector(ipType int, useTLS bool) {
-	var bandwidth int
-	var taskNum int
+	bandwidth := 1
+	expectedLatency := 0
+	expectedDataCenter := ""
+	expectedCount := 1
+	rttTestCount := 100
+	rttTestAll := false
+	taskNum := 50
+
+	scanner := bufio.NewScanner(os.Stdin)
 
 	fmt.Print("请设置期望的带宽大小 (默认最小 1，单位 Mbps): ")
-	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
@@ -93,6 +130,61 @@ func runIPSelector(ipType int, useTLS bool) {
 				bandwidth = 1
 			} else {
 				bandwidth = val
+			}
+		}
+	}
+
+	fmt.Print("请设置期望延迟 (默认不限，单位 毫秒): ")
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input != "" {
+			val, err := strconv.Atoi(input)
+			if err != nil || val <= 0 {
+				fmt.Println("输入无效，已不限制期望延迟")
+				expectedLatency = 0
+			} else {
+				expectedLatency = val
+			}
+		}
+	}
+
+	fmt.Print("请设置期望数据中心位置 (默认不限，可输入三字码/城市/区域/国家代码): ")
+	if scanner.Scan() {
+		expectedDataCenter = strings.TrimSpace(scanner.Text())
+	}
+
+	fmt.Print("请设置期望个数 (默认 1，最大 100): ")
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input != "" {
+			val, err := strconv.Atoi(input)
+			if err != nil || val <= 0 {
+				fmt.Println("输入无效，已使用默认值 1")
+				expectedCount = 1
+			} else {
+				expectedCount = val
+			}
+			if expectedCount > 100 {
+				fmt.Println("超过最大数量限制，自动设置为最大值 100")
+				expectedCount = 100
+			}
+		}
+	}
+
+	fmt.Print("请设置 RTT 测试数量 (默认 100，输入 all 测试全部): ")
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input != "" {
+			if strings.EqualFold(input, "all") || input == "全部" {
+				rttTestAll = true
+			} else {
+				val, err := strconv.Atoi(input)
+				if err != nil || val <= 0 {
+					fmt.Println("输入无效，已使用默认值 100")
+					rttTestCount = 100
+				} else {
+					rttTestCount = val
+				}
 			}
 		}
 	}
@@ -124,23 +216,75 @@ func runIPSelector(ipType int, useTLS bool) {
 	startTime := time.Now()
 
 	// 执行 Cloudflare 测试
-	anycast, max, avgms, dataCenter := cloudflareTest(ipType, useTLS, taskNum, speed)
-
-	realBandwidth := max / 128
+	results := cloudflareTest(ipType, useTLS, taskNum, speed, expectedLatency, expectedDataCenter, expectedCount, rttTestCount, rttTestAll, nil)
+	if len(results) > 0 {
+		fmt.Println()
+		fmt.Println("初始优选结果")
+		printSelectionResults(results)
+		fmt.Print("如需继续按更低延迟替换最高延迟候选，请输入新的延迟阈值 (留空跳过，单位毫秒): ")
+		if scanner.Scan() {
+			input := strings.TrimSpace(scanner.Text())
+			if input != "" {
+				val, err := strconv.Atoi(input)
+				if err != nil || val <= 0 {
+					fmt.Println("输入无效，跳过候选替换")
+				} else {
+					results = replaceSlowestCandidates(ipType, useTLS, taskNum, speed, expectedDataCenter, results, val, rttTestCount, rttTestAll)
+				}
+			}
+		}
+	}
 	endTime := time.Now()
 
 	fmt.Println()
-	fmt.Println("优选 IP:", anycast)
 	fmt.Println("设置带宽:", bandwidth, "Mbps")
-	fmt.Println("实测带宽:", realBandwidth, "Mbps")
-	fmt.Println("峰值速度:", max, "kB/s")
-	fmt.Println("往返延迟:", avgms, "毫秒")
-	fmt.Println("数据中心:", dataCenter)
+	if expectedLatency > 0 {
+		fmt.Println("期望延迟:", expectedLatency, "毫秒以内")
+	}
+	if expectedDataCenter != "" {
+		fmt.Println("期望数据中心:", expectedDataCenter)
+	}
+	fmt.Println("期望个数:", expectedCount)
+	if rttTestAll {
+		fmt.Println("RTT 测试数量: 全部")
+	} else {
+		fmt.Println("RTT 测试数量:", rttTestCount)
+	}
+	fmt.Printf("优选结果: %d 个\n", len(results))
+	printSelectionResults(results)
 	fmt.Println("总计用时:", int(endTime.Sub(startTime).Seconds()), "秒")
 }
 
+// SelectionResult 优选结果
+type SelectionResult struct {
+	IP         string
+	MaxSpeed   int
+	LatencyMs  int
+	DataCenter string
+}
+
+func printSelectionResults(results []SelectionResult) {
+	for i, result := range results {
+		fmt.Printf("%d. 优选 IP: %s, 实测带宽: %.2f Mbps, 峰值速度: %s, 往返延迟: %d 毫秒, 数据中心: %s\n",
+			i+1, result.IP, speedKBToMbps(result.MaxSpeed), formatSpeed(result.MaxSpeed), result.LatencyMs, result.DataCenter)
+	}
+}
+
+func speedKBToMbps(speedKB int) float64 {
+	return float64(speedKB) / 128
+}
+
+func formatSpeed(speedKB int) string {
+	return fmt.Sprintf("%.2f Mbps (%d kB/s)", speedKBToMbps(speedKB), speedKB)
+}
+
 // cloudflareTest 核心测试逻辑
-func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, int, int, string) {
+func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLatency int, expectedDataCenter string, expectedCount int, rttTestCount int, rttTestAll bool, skipIPs map[string]struct{}) []SelectionResult {
+	expectedDataCenter = strings.TrimSpace(expectedDataCenter)
+	if expectedCount <= 0 {
+		expectedCount = 1
+	}
+
 	downloadAllData()
 	filename := dataPath("ips-v4.txt")
 	if ipType == 6 {
@@ -149,15 +293,26 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, in
 	content, err := getFileContent(filename)
 	if err != nil {
 		fmt.Println("读取 IP 列表失败:", err)
-		return "", 0, 0, ""
+		return nil
 	}
 	ipList := parseIPList(content)
 	fmt.Printf("正在从 %d 个子网中随机生成 IP...\n", len(ipList))
-
-	sampleSize := 100
-	if len(ipList) < sampleSize {
-		sampleSize = len(ipList)
+	if len(ipList) == 0 {
+		fmt.Println("IP 列表为空，无法执行 RTT 测试")
+		return nil
 	}
+
+	sampleSize := normalizeRTTTestCount(len(ipList), rttTestCount, rttTestAll)
+	if rttTestAll {
+		fmt.Printf("每轮 RTT 测试数量: 全部 (%d)\n", sampleSize)
+	} else {
+		fmt.Printf("每轮 RTT 测试数量: %d\n", sampleSize)
+	}
+	rttKeepCount := rttResultKeepCount(sampleSize, expectedCount, expectedDataCenter != "")
+
+	var selectedResults []SelectionResult
+	selectedIPs := cloneIPSet(skipIPs)
+	testedIPs := cloneIPSet(skipIPs)
 
 	for {
 		var rttResults []RTTResult
@@ -170,44 +325,265 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, in
 			} else {
 				testIPs = getRandomIPv4s(sampled)
 			}
+			testIPs = filterNewIPs(testIPs, testedIPs)
+			if len(testIPs) == 0 {
+				fmt.Println("当前生成的 IP 都已测试过，继续生成新的测试 IP...")
+				continue
+			}
 
 			fmt.Printf("已生成 %d 个测试 IP，开始 RTT 测试...\n", len(testIPs))
 
-			rttResults = runRTTTest(testIPs, taskNum, useTLS)
+			rttResults = runRTTTest(testIPs, taskNum, useTLS, rttKeepCount)
 			if len(rttResults) > 0 {
 				break
 			}
 			fmt.Println("当前所有 IP 都存在 RTT 丢包，继续新的 RTT 测试...")
 		}
 
+		if expectedLatency > 0 {
+			filteredResults := filterRTTResultsByLatency(rttResults, expectedLatency)
+			if len(filteredResults) == 0 {
+				fmt.Printf("当前所有 IP 的 RTT 都超过期望延迟 %d 毫秒，继续新的 RTT 测试...\n", expectedLatency)
+				continue
+			}
+			if len(filteredResults) < len(rttResults) {
+				fmt.Printf("已按期望延迟 <= %d 毫秒过滤，保留 %d 个 IP\n", expectedLatency, len(filteredResults))
+			}
+			rttResults = filteredResults
+		}
+
+		if expectedDataCenter != "" {
+			filteredResults := filterRTTResultsByDataCenter(rttResults, expectedDataCenter)
+			if len(filteredResults) == 0 {
+				fmt.Printf("当前所有 IP 的 RTT 数据中心都未达到期望 %s，继续新的 RTT 测试...\n", expectedDataCenter)
+				continue
+			}
+			if len(filteredResults) < len(rttResults) {
+				fmt.Printf("已按期望数据中心 %s 提前过滤，保留 %d 个 IP\n", expectedDataCenter, len(filteredResults))
+			}
+			rttResults = filteredResults
+		}
+
 		fmt.Println("待测速的 IP 地址")
 		for _, r := range rttResults {
-			fmt.Printf("%s 往返延迟 %d 毫秒\n", r.IP, r.LatencyMs)
-		}
-
-		// 速度测试
-		for _, r := range rttResults {
-			fmt.Println("正在测试", r.IP)
-			speedPort := 80
-			if useTLS {
-				speedPort = 443
-			}
-			maxSpeed, tcpMs, dc := runSpeedTestSimple(r.IP, speedPort, useTLS)
-			fmt.Printf("%s 峰值速度 %d kB/s", r.IP, maxSpeed)
-			if dc != "" {
-				fmt.Printf(", 数据中心 %s", lookupDataCenter(dc))
-			}
-			fmt.Println()
-
-			if maxSpeed >= speed {
-				if dc != "" {
-					return r.IP, maxSpeed, tcpMs, lookupDataCenter(dc)
-				}
-				return r.IP, maxSpeed, tcpMs, dc
+			if r.DataCenter != "" {
+				fmt.Printf("%s 往返延迟 %d 毫秒，数据中心 %s\n", r.IP, r.LatencyMs, formatDataCenter(r.DataCenter))
+			} else {
+				fmt.Printf("%s 往返延迟 %d 毫秒\n", r.IP, r.LatencyMs)
 			}
 		}
-		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
+
+		neededCount := expectedCount - len(selectedResults)
+		speedResults := runSerialSpeedTests(rttResults, useTLS, speed, expectedDataCenter, selectedIPs, neededCount)
+		for _, result := range speedResults {
+			selectedResults = append(selectedResults, result)
+			selectedIPs[result.IP] = struct{}{}
+			fmt.Printf("已找到 %d/%d 个符合期望条件的 IP\n", len(selectedResults), expectedCount)
+			if len(selectedResults) >= expectedCount {
+				return selectedResults
+			}
+		}
+		fmt.Printf("当前已找到 %d/%d 个符合期望条件的 IP，重新开始新一轮测试...\n", len(selectedResults), expectedCount)
 	}
+}
+
+// replaceSlowestCandidates 按新延迟阈值替换当前结果中延迟最高的候选
+func replaceSlowestCandidates(ipType int, useTLS bool, taskNum int, speed int, expectedDataCenter string, results []SelectionResult, maxLatency int, rttTestCount int, rttTestAll bool) []SelectionResult {
+	if len(results) == 0 {
+		return results
+	}
+
+	skippedIPs := selectionIPSet(results)
+	for {
+		worstIndex := highestLatencyIndex(results)
+		if worstIndex < 0 || results[worstIndex].LatencyMs <= maxLatency {
+			fmt.Printf("当前所有候选延迟均已 <= %d 毫秒\n", maxLatency)
+			return results
+		}
+
+		worst := results[worstIndex]
+		fmt.Printf("当前最高延迟候选为 %s (%d 毫秒)，继续寻找 <= %d 毫秒的替换 IP...\n", worst.IP, worst.LatencyMs, maxLatency)
+		replacements := cloudflareTest(ipType, useTLS, taskNum, speed, maxLatency, expectedDataCenter, 1, rttTestCount, rttTestAll, skippedIPs)
+		if len(replacements) == 0 {
+			return results
+		}
+
+		fmt.Printf("替换候选: %s (%d 毫秒) -> %s (%d 毫秒)\n", worst.IP, worst.LatencyMs, replacements[0].IP, replacements[0].LatencyMs)
+		skippedIPs[worst.IP] = struct{}{}
+		skippedIPs[replacements[0].IP] = struct{}{}
+		results[worstIndex] = replacements[0]
+	}
+}
+
+func runSerialSpeedTests(rttResults []RTTResult, useTLS bool, expectedSpeed int, expectedDataCenter string, selectedIPs map[string]struct{}, neededCount int) []SelectionResult {
+	if neededCount <= 0 || len(rttResults) == 0 {
+		return nil
+	}
+
+	speedPort := 80
+	if useTLS {
+		speedPort = 443
+	}
+
+	var selectedResults []SelectionResult
+	acceptedIPs := cloneIPSet(selectedIPs)
+	fmt.Printf("开始单线程速度测试，候选数 %d\n", len(rttResults))
+	for _, r := range rttResults {
+		if _, ok := acceptedIPs[r.IP]; ok {
+			fmt.Printf("%s 已在优选结果中，跳过重复测速\n", r.IP)
+			continue
+		}
+
+		maxSpeed, _, dc := runSpeedTestSimple(context.Background(), r.IP, speedPort, useTLS)
+		fmt.Printf("%s 峰值速度 %s", r.IP, formatSpeed(maxSpeed))
+		if dc != "" {
+			fmt.Printf(", 数据中心 %s", formatDataCenter(dc))
+		}
+		if expectedDataCenter != "" && !matchesDataCenter(dc, expectedDataCenter) {
+			fmt.Printf(", 未达到期望数据中心 %s", expectedDataCenter)
+			fmt.Println()
+			continue
+		}
+		fmt.Println()
+
+		if maxSpeed < expectedSpeed {
+			continue
+		}
+		acceptedIPs[r.IP] = struct{}{}
+
+		dataCenter := dc
+		if dataCenter != "" {
+			dataCenter = formatDataCenter(dataCenter)
+		}
+		selectedResults = append(selectedResults, SelectionResult{
+			IP:         r.IP,
+			MaxSpeed:   maxSpeed,
+			LatencyMs:  r.LatencyMs,
+			DataCenter: dataCenter,
+		})
+	}
+
+	sort.Slice(selectedResults, func(i, j int) bool {
+		if selectedResults[i].MaxSpeed == selectedResults[j].MaxSpeed {
+			return selectedResults[i].LatencyMs < selectedResults[j].LatencyMs
+		}
+		return selectedResults[i].MaxSpeed > selectedResults[j].MaxSpeed
+	})
+
+	if len(selectedResults) > neededCount {
+		selectedResults = selectedResults[:neededCount]
+	}
+	return selectedResults
+}
+
+func highestLatencyIndex(results []SelectionResult) int {
+	if len(results) == 0 {
+		return -1
+	}
+	worstIndex := 0
+	for i := 1; i < len(results); i++ {
+		if results[i].LatencyMs > results[worstIndex].LatencyMs {
+			worstIndex = i
+		}
+	}
+	return worstIndex
+}
+
+func selectionIPSet(results []SelectionResult) map[string]struct{} {
+	ipSet := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result.IP != "" {
+			ipSet[result.IP] = struct{}{}
+		}
+	}
+	return ipSet
+}
+
+func cloneIPSet(ipSet map[string]struct{}) map[string]struct{} {
+	cloned := make(map[string]struct{}, len(ipSet))
+	for ip := range ipSet {
+		cloned[ip] = struct{}{}
+	}
+	return cloned
+}
+
+func filterNewIPs(ipList []string, testedIPs map[string]struct{}) []string {
+	newIPs := make([]string, 0, len(ipList))
+	for _, ip := range ipList {
+		if ip == "" {
+			continue
+		}
+		if _, ok := testedIPs[ip]; ok {
+			continue
+		}
+		testedIPs[ip] = struct{}{}
+		newIPs = append(newIPs, ip)
+	}
+	return newIPs
+}
+
+// normalizeRTTTestCount 计算每轮 RTT 测试数量
+func normalizeRTTTestCount(total int, requested int, all bool) int {
+	if total <= 0 {
+		return 0
+	}
+	if all {
+		return total
+	}
+	if requested <= 0 {
+		requested = 100
+	}
+	if requested > total {
+		return total
+	}
+	return requested
+}
+
+func rttResultKeepCount(sampleSize int, expectedCount int, hasExpectedDataCenter bool) int {
+	if sampleSize <= 0 {
+		return 0
+	}
+	if hasExpectedDataCenter {
+		return sampleSize
+	}
+	keepCount := expectedCount * 3
+	if keepCount < 10 {
+		keepCount = 10
+	}
+	if keepCount > sampleSize {
+		return sampleSize
+	}
+	return keepCount
+}
+
+// filterRTTResultsByLatency 按最大 RTT 延迟过滤测试结果
+func filterRTTResultsByLatency(results []RTTResult, maxLatency int) []RTTResult {
+	if maxLatency <= 0 {
+		return results
+	}
+
+	filtered := make([]RTTResult, 0, len(results))
+	for _, result := range results {
+		if result.LatencyMs <= maxLatency {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
+}
+
+// filterRTTResultsByDataCenter 按 RTT 阶段拿到的数据中心提前过滤测试结果
+func filterRTTResultsByDataCenter(results []RTTResult, expectedDataCenter string) []RTTResult {
+	if strings.TrimSpace(expectedDataCenter) == "" {
+		return results
+	}
+
+	filtered := make([]RTTResult, 0, len(results))
+	for _, result := range results {
+		if matchesDataCenter(result.DataCenter, expectedDataCenter) {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
 }
 
 // randomSample 从列表中随机抽取 n 个元素
@@ -227,12 +603,13 @@ func randomSample(list []string, n int) []string {
 
 // RTTResult RTT 测试结果
 type RTTResult struct {
-	IP        string
-	LatencyMs int
+	IP         string
+	LatencyMs  int
+	DataCenter string
 }
 
 // runRTTTest 运行 RTT 测试（并发，带进度显示）
-func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
+func runRTTTest(ipList []string, taskNum int, useTLS bool, keepCount int) []RTTResult {
 	if len(ipList) < taskNum {
 		taskNum = len(ipList)
 	}
@@ -260,9 +637,9 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 				}
 			}()
 
-			avgMs := testRTT(ip, useTLS)
+			avgMs, dc := testRTT(ip, useTLS)
 			if avgMs > 0 {
-				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs}
+				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, DataCenter: dc}
 			}
 		}(ip)
 	}
@@ -277,14 +654,17 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 		results = append(results, r)
 	}
 
-	// 按最小延迟排序，最多保留前 10 个进入速度测试
+	// 按最小延迟排序，保留指定数量进入后续过滤和速度测试
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].LatencyMs < results[j].LatencyMs
 	})
 
-	if len(results) > 10 {
-		fmt.Printf("RTT 测试完成，%d/%d 个 IP 有效，保留延迟最低的 10 个\n", len(results), total)
-		results = results[:10]
+	if keepCount <= 0 {
+		keepCount = 10
+	}
+	if len(results) > keepCount {
+		fmt.Printf("RTT 测试完成，%d/%d 个 IP 有效，保留延迟最低的 %d 个\n", len(results), total, keepCount)
+		results = results[:keepCount]
 	} else {
 		fmt.Printf("RTT 测试完成，%d/%d 个 IP 有效\n", len(results), total)
 	}
@@ -293,29 +673,30 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 
 // testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）
 // 连续 3 次取 TCP 连接时间，取平均延迟，中间任何一次失败直接丢弃
-func testRTT(ip string, useTLS bool) int {
+func testRTT(ip string, useTLS bool) (int, string) {
 	port := 80
 	if useTLS {
 		port = 443
 	}
 
 	var totalMs int
+	var dataCenter string
 	for range 3 {
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 1*time.Second)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), rttDialTimeout)
 		if err != nil {
-			return 0
+			return 0, ""
 		}
 		tcpDuration := time.Since(start)
 
-		conn.SetDeadline(start.Add(1 * time.Second))
+		conn.SetDeadline(start.Add(rttAttemptTimeout))
 
 		var rwc net.Conn = conn
 		if useTLS {
 			tlsConn := tls.Client(conn, &tls.Config{ServerName: "cloudflare.com", InsecureSkipVerify: true})
 			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
-				return 0
+				return 0, ""
 			}
 			rwc = tlsConn
 		}
@@ -324,34 +705,37 @@ func testRTT(ip string, useTLS bool) int {
 		_, err = rwc.Write([]byte(reqStr))
 		if err != nil {
 			rwc.Close()
-			return 0
+			return 0, ""
 		}
 
 		reader := bufio.NewReader(rwc)
 		resp, err := http.ReadResponse(reader, nil)
 		rwc.Close()
 		if err != nil {
-			return 0
+			return 0, ""
 		}
 		resp.Body.Close()
 
-		if resp.Header.Get("CF-RAY") == "" {
-			return 0
+		dc := extractDataCenter(resp.Header.Get("CF-RAY"))
+		if dc == "" {
+			return 0, ""
 		}
+		dataCenter = dc
 
 		totalMs += int(tcpDuration.Milliseconds())
 	}
 
-	return totalMs / 3
+	return totalMs / 3, dataCenter
 }
 
 // runSpeedTestSimple 简单速度测试，返回 (峰值速度 kB/s, TCP延迟ms, 三字码头)
-func runSpeedTestSimple(ip string, port int, useTLS bool) (int, int, string) {
+func runSpeedTestSimple(ctx context.Context, ip string, port int, useTLS bool) (int, int, string) {
 	var tcpMs int
+	dialer := &net.Dialer{Timeout: speedDialTimeout}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			start := time.Now()
-			conn, err := net.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+			conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 			if err == nil {
 				tcpMs = int(time.Since(start).Milliseconds())
 			}
@@ -363,7 +747,7 @@ func runSpeedTestSimple(ip string, port int, useTLS bool) (int, int, string) {
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Second,
+		Timeout:   speedTestTimeout,
 	}
 
 	scheme := "http"
@@ -372,7 +756,11 @@ func runSpeedTestSimple(ip string, port int, useTLS bool) (int, int, string) {
 	}
 	testURL := fmt.Sprintf("%s://%s/%s", scheme, speedTestDomain, speedTestFile)
 
-	resp, err := client.Get(testURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
+	if err != nil {
+		return 0, 0, ""
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, ""
 	}
@@ -420,7 +808,7 @@ func extractDataCenter(cfRay string) string {
 	if len(parts) < 2 {
 		return ""
 	}
-	return strings.TrimSpace(parts[len(parts)-1])
+	return strings.ToUpper(strings.TrimSpace(parts[len(parts)-1]))
 }
 
 // lookupDataCenter 查找数据中心名称
@@ -433,6 +821,61 @@ func lookupDataCenter(colo string) string {
 		return loc.City
 	}
 	return colo
+}
+
+// formatDataCenter 返回城市名和三字码，方便用户核对期望数据中心
+func formatDataCenter(colo string) string {
+	colo = strings.ToUpper(strings.TrimSpace(colo))
+	if colo == "" {
+		return ""
+	}
+
+	name := lookupDataCenter(colo)
+	if name == "" || strings.EqualFold(name, colo) {
+		return colo
+	}
+	return fmt.Sprintf("%s (%s)", name, colo)
+}
+
+// matchesDataCenter 判断 CF 数据中心是否符合用户期望位置
+func matchesDataCenter(colo string, expected string) bool {
+	expected = normalizeDataCenterText(expected)
+	if expected == "" {
+		return true
+	}
+
+	colo = strings.ToUpper(strings.TrimSpace(colo))
+	if colo == "" {
+		return false
+	}
+
+	locationMu.RLock()
+	loc := locationMap[colo]
+	locationMu.RUnlock()
+
+	candidates := []string{colo, loc.Iata, loc.City, loc.Region, loc.Cca2}
+	for _, candidate := range candidates {
+		normalizedCandidate := normalizeDataCenterText(candidate)
+		if normalizedCandidate == "" {
+			continue
+		}
+		if len(expected) <= 3 {
+			if normalizedCandidate == expected {
+				return true
+			}
+			continue
+		}
+		if normalizedCandidate == expected || strings.Contains(normalizedCandidate, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeDataCenterText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	replacer := strings.NewReplacer(" ", "", "\t", "", "-", "", "_", "")
+	return replacer.Replace(value)
 }
 
 // runSingleSpeedTest 单 IP 测速
@@ -471,11 +914,11 @@ func runSingleSpeedTest(useTLS bool) {
 
 	fmt.Printf("正在测速 %s 端口 %d\n", ip, port)
 
-	speedKB, tcpMs, dc := runSpeedTestSimple(ip, port, useTLS)
+	speedKB, tcpMs, dc := runSpeedTestSimple(context.Background(), ip, port, useTLS)
 	if dc != "" {
-		fmt.Printf("%s 平均速度 %d kB/s, TCP延迟 %dms, 数据中心=%s\n", ip, speedKB, tcpMs, lookupDataCenter(dc))
+		fmt.Printf("%s 峰值速度 %s, TCP延迟 %dms, 数据中心=%s\n", ip, formatSpeed(speedKB), tcpMs, formatDataCenter(dc))
 	} else {
-		fmt.Printf("%s 平均速度 %d kB/s, TCP延迟 %dms\n", ip, speedKB, tcpMs)
+		fmt.Printf("%s 峰值速度 %s, TCP延迟 %dms\n", ip, formatSpeed(speedKB), tcpMs)
 	}
 }
 
@@ -498,14 +941,21 @@ func updateData() {
 
 // ----------------------- 工具函数 -----------------------
 
+const (
+	rttDialTimeout    = 250 * time.Millisecond
+	rttAttemptTimeout = 250 * time.Millisecond
+	speedDialTimeout  = 800 * time.Millisecond
+	speedTestTimeout  = 4 * time.Second
+)
+
 var (
-	dataDir          string
-	randomMu         sync.Mutex
-	randomGenerator  = rand.New(rand.NewSource(time.Now().UnixNano()))
-	locationMap      map[string]location
-	locationMu       sync.RWMutex
-	speedTestDomain  string
-	speedTestFile    string
+	dataDir         string
+	randomMu        sync.Mutex
+	randomGenerator = rand.New(rand.NewSource(time.Now().UnixNano()))
+	locationMap     map[string]location
+	locationMu      sync.RWMutex
+	speedTestDomain string
+	speedTestFile   string
 )
 
 type location struct {
@@ -643,9 +1093,9 @@ func downloadAllData() {
 			return
 		}
 		if err := saveToFile(urlFilename, content); err != nil {
-				fmt.Println("保存测速 URL 失败:", err)
-				return
-			}
+			fmt.Println("保存测速 URL 失败:", err)
+			return
+		}
 	}
 
 	content, err := getFileContent(urlFilename)
@@ -675,9 +1125,9 @@ func downloadAllData() {
 				return
 			}
 			if err := saveToFile(fp, c); err != nil {
-					fmt.Println("保存 IP 列表失败:", err)
-					return
-				}
+				fmt.Println("保存 IP 列表失败:", err)
+				return
+			}
 		}
 	}
 
@@ -696,9 +1146,9 @@ func downloadAllData() {
 			return
 		}
 		if err := saveToFile(fp, string(body)); err != nil {
-				fmt.Println("保存位置信息失败:", err)
-				return
-			}
+			fmt.Println("保存位置信息失败:", err)
+			return
+		}
 	}
 }
 
@@ -721,7 +1171,12 @@ func initLocations() {
 
 	loadedMap := make(map[string]location)
 	for _, loc := range locations {
-		loadedMap[loc.Iata] = loc
+		iata := strings.ToUpper(strings.TrimSpace(loc.Iata))
+		if iata == "" {
+			continue
+		}
+		loc.Iata = iata
+		loadedMap[iata] = loc
 	}
 
 	locationMu.Lock()

@@ -63,18 +63,68 @@ o) 提供影视、软件和应用等下载服务的网站。
 
 更多自定义玩法待用户自己发现
 
+## 优选条件
+
+优选流程支持设置以下期望条件：
+
+- 期望带宽：单位 Mbps，默认 1 Mbps。
+- 期望延迟：单位毫秒，留空表示不限制。程序会在 RTT 测试后过滤超过该延迟的 IP。
+- 期望数据中心位置：留空表示不限制。可输入 Cloudflare 数据中心三字码、城市名、区域名或国家/地区代码，例如 `HKG`、`Hong Kong`、`Asia-Pacific`、`HK`。
+- 期望个数：默认 1，最大 100。程序会持续测试，直到找到指定数量的优选 IP。
+- RTT 测试数量：默认 100。可输入数字指定每轮生成并测试的 IP 数量，输入 `all` 表示每轮测试全部子网各随机生成的 1 个 IP。
+- RTT 测试进程数：默认 50，最大 100，只控制 RTT 阶段的并发数量。
+- 延迟替换：初次选满后可再输入一个更低的延迟阈值，程序会继续寻找符合该延迟的新 IP，并优先替换当前候选中延迟最高的 IP。
+- 速度显示：结果以 Mbps 为主，同时保留 kB/s 方便核对原始测速值。
+- 超时控制：RTT 连接与单次请求压制到 250ms，测速阶段设置了连接超时和 4 秒总超时，用于更快跳过不可用 IP。
+- 测速方式：速度测试阶段保持单线程逐个下载，避免多个候选同时测速互相抢占带宽导致失真；每轮候选测完后按峰值速度降序选出最快的达标 IP。
+
+当设置了多个期望条件时，优选 IP 需要同时满足带宽、延迟、数据中心位置和个数要求。
+
 ## 测试流程
 
 1. **随机生成 IP** — 从子网列表中随机抽样，IPv4 保留前 3 段末尾随机，IPv6 保留前 3 段后 5 段随机
-2. **RTT 测试** — 并发 TCP 握手 + HTTP GET，验证 CF-RAY 头，3 次取平均延迟，按延迟升序排序
-3. **速度测试** — 串行下载测速文件，每 1 秒滑动窗口计算瞬时峰值速度，首个达到设定带宽的 IP 即为优选结果
+2. **RTT 测试** — 并发 TCP 握手 + HTTP GET，验证 CF-RAY 头，记录 RTT 阶段数据中心，3 次取平均延迟，按延迟升序排序，并按期望延迟和期望数据中心提前过滤
+3. **速度测试** — 单线程逐个下载测速文件，每 1 秒滑动窗口计算瞬时峰值速度，同时再次匹配测速响应的数据中心位置，收集达到设定条件的 IP，并按峰值速度降序选择本轮最快结果
+4. **去重测试** — 同一轮优选中已生成测试过的 IP 不会重复测试，替换候选时也会跳过当前已选 IP
+5. **结果输出** — 达到期望个数后输出全部优选结果，可继续输入新的延迟阈值替换当前最高延迟候选
 
 ## 编译运行
 
 确保已安装 Go 1.22 及以上版本，然后执行：
 
+本机 Native 优化构建 Windows exe：
+
+``` powershell
+powershell -ExecutionPolicy Bypass -File .\build-native.ps1
+```
+
+脚本只构建当前 Windows 主机的 `better-cloudflare-ip.exe`。在 amd64 机器上会自动探测可运行的最高 `GOAMD64` 等级，也可以手动指定：
+
+``` powershell
+powershell -ExecutionPolicy Bypass -File .\build-native.ps1 -GOAMD64 v3
+```
+
+脚本默认使用 Go PGO 的 `auto` 模式。目录中存在 `default.pgo` 时会自动用于优化；也可以手动指定或关闭：
+
+``` powershell
+powershell -ExecutionPolicy Bypass -File .\build-native.ps1 -PGO .\default.pgo
+powershell -ExecutionPolicy Bypass -File .\build-native.ps1 -PGO off
+```
+
+生成本项目可用的 PGO profile：
+
+``` powershell
+$env:BCFI_CPU_PROFILE = "default.pgo"
+go run main.go
+Remove-Item Env:\BCFI_CPU_PROFILE
+```
+
+运行时按你的常用方式完成一次典型优选流程并从菜单退出，生成的 `default.pgo` 会在下一次 native 构建时自动生效。
+
+通用构建：
+
 ``` bash
-go build -o better-cloudflare-ip . && ./better-cloudflare-ip
+go build -o better-cloudflare-ip main.go && ./better-cloudflare-ip
 ```
 
 或直接运行：
