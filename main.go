@@ -115,8 +115,40 @@ func runIPSelector(ipType int, useTLS bool) {
 	rttTestCount := 100
 	rttTestAll := false
 	taskNum := 50
+	rttServerName := defaultRTTServerName
+	rttTimeout := defaultRTTTimeout
 
 	scanner := bufio.NewScanner(os.Stdin)
+	if useTLS {
+		fmt.Printf("请设置 RTT TLS SNI (默认 %s): ", defaultRTTServerName)
+		if scanner.Scan() {
+			input := strings.TrimSpace(scanner.Text())
+			if input != "" {
+				if isValidServerName(input) {
+					rttServerName = input
+				} else {
+					fmt.Printf("SNI 无效，已使用默认值 %s\n", defaultRTTServerName)
+				}
+			}
+		}
+	}
+
+	fmt.Printf("请设置 RTT 超时 (默认 %d，最低 %d，单位毫秒): ", int(defaultRTTTimeout/time.Millisecond), minRTTTimeoutMs)
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input != "" {
+			val, err := strconv.Atoi(input)
+			if err != nil || val <= 0 {
+				fmt.Printf("输入无效，已使用默认值 %d 毫秒\n", int(defaultRTTTimeout/time.Millisecond))
+			} else {
+				if val < minRTTTimeoutMs {
+					fmt.Printf("低于最低超时限制，自动设置为 %d 毫秒\n", minRTTTimeoutMs)
+					val = minRTTTimeoutMs
+				}
+				rttTimeout = time.Duration(val) * time.Millisecond
+			}
+		}
+	}
 
 	fmt.Print("请设置期望的带宽大小 (默认最小 1，单位 Mbps): ")
 	if scanner.Scan() {
@@ -216,7 +248,7 @@ func runIPSelector(ipType int, useTLS bool) {
 	startTime := time.Now()
 
 	// 执行 Cloudflare 测试
-	results := cloudflareTest(ipType, useTLS, taskNum, speed, expectedLatency, expectedDataCenter, expectedCount, rttTestCount, rttTestAll, nil)
+	results := cloudflareTest(ipType, useTLS, taskNum, speed, expectedLatency, expectedDataCenter, expectedCount, rttTestCount, rttTestAll, rttServerName, rttTimeout, nil)
 	if len(results) > 0 {
 		fmt.Println()
 		fmt.Println("初始优选结果")
@@ -229,9 +261,16 @@ func runIPSelector(ipType int, useTLS bool) {
 				if err != nil || val <= 0 {
 					fmt.Println("输入无效，跳过候选替换")
 				} else {
-					results = replaceSlowestCandidates(ipType, useTLS, taskNum, speed, expectedDataCenter, results, val, rttTestCount, rttTestAll)
+					results = replaceSlowestCandidates(ipType, useTLS, taskNum, speed, expectedDataCenter, results, val, rttTestCount, rttTestAll, rttServerName, rttTimeout)
 				}
 			}
+		}
+	}
+	if len(results) > 0 {
+		if err := recordValidIPs(results); err != nil {
+			fmt.Println("记录有效 IP 失败:", err)
+		} else {
+			fmt.Println("有效 IP 已记录到", dataPath(validIPTextFile))
 		}
 	}
 	endTime := time.Now()
@@ -244,6 +283,10 @@ func runIPSelector(ipType int, useTLS bool) {
 	if expectedDataCenter != "" {
 		fmt.Println("期望数据中心:", expectedDataCenter)
 	}
+	if useTLS {
+		fmt.Println("RTT TLS SNI:", rttServerName)
+	}
+	fmt.Println("RTT 超时:", int(rttTimeout/time.Millisecond), "毫秒")
 	fmt.Println("期望个数:", expectedCount)
 	if rttTestAll {
 		fmt.Println("RTT 测试数量: 全部")
@@ -263,11 +306,123 @@ type SelectionResult struct {
 	DataCenter string
 }
 
+type validIPRecord struct {
+	IP         string `json:"ip"`
+	MaxSpeed   int    `json:"max_speed_kb"`
+	LatencyMs  int    `json:"latency_ms"`
+	DataCenter string `json:"data_center,omitempty"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
 func printSelectionResults(results []SelectionResult) {
 	for i, result := range results {
 		fmt.Printf("%d. 优选 IP: %s, 实测带宽: %.2f Mbps, 峰值速度: %s, 往返延迟: %d 毫秒, 数据中心: %s\n",
 			i+1, result.IP, speedKBToMbps(result.MaxSpeed), formatSpeed(result.MaxSpeed), result.LatencyMs, result.DataCenter)
 	}
+}
+
+func recordValidIPs(results []SelectionResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+
+	records := loadValidIPRecords()
+	recordByIP := make(map[string]validIPRecord, len(records)+len(results))
+	for _, record := range records {
+		if record.IP != "" {
+			recordByIP[record.IP] = record
+		}
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	for _, result := range results {
+		if result.IP == "" {
+			continue
+		}
+		record := validIPRecord{
+			IP:         result.IP,
+			MaxSpeed:   result.MaxSpeed,
+			LatencyMs:  result.LatencyMs,
+			DataCenter: result.DataCenter,
+			UpdatedAt:  now,
+		}
+		old, ok := recordByIP[result.IP]
+		if ok && !isBetterValidIPRecord(record, old) {
+			old.UpdatedAt = now
+			if record.DataCenter != "" {
+				old.DataCenter = record.DataCenter
+			}
+			recordByIP[result.IP] = old
+			continue
+		}
+		recordByIP[result.IP] = record
+	}
+
+	records = records[:0]
+	for _, record := range recordByIP {
+		records = append(records, record)
+	}
+	sortValidIPRecords(records)
+
+	body, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(dataPath(validIPJSONFile), body, 0644); err != nil {
+		return err
+	}
+	return os.WriteFile(dataPath(validIPTextFile), []byte(formatValidIPText(records)), 0644)
+}
+
+func loadValidIPRecords() []validIPRecord {
+	body, err := os.ReadFile(dataPath(validIPJSONFile))
+	if err != nil {
+		return nil
+	}
+	var records []validIPRecord
+	if err := json.Unmarshal(body, &records); err != nil {
+		fmt.Println("读取有效 IP 记录失败，已重新生成:", err)
+		return nil
+	}
+	return records
+}
+
+func isBetterValidIPRecord(candidate validIPRecord, current validIPRecord) bool {
+	if candidate.LatencyMs > 0 && (current.LatencyMs <= 0 || candidate.LatencyMs < current.LatencyMs) {
+		return true
+	}
+	if candidate.LatencyMs == current.LatencyMs && candidate.MaxSpeed > current.MaxSpeed {
+		return true
+	}
+	return false
+}
+
+func sortValidIPRecords(records []validIPRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].LatencyMs == records[j].LatencyMs {
+			if records[i].MaxSpeed == records[j].MaxSpeed {
+				return records[i].IP < records[j].IP
+			}
+			return records[i].MaxSpeed > records[j].MaxSpeed
+		}
+		if records[i].LatencyMs <= 0 {
+			return false
+		}
+		if records[j].LatencyMs <= 0 {
+			return true
+		}
+		return records[i].LatencyMs < records[j].LatencyMs
+	})
+}
+
+func formatValidIPText(records []validIPRecord) string {
+	var builder strings.Builder
+	builder.WriteString("IP\tLatencyMs\tMbps\tkB/s\tDataCenter\tUpdatedAt\n")
+	for _, record := range records {
+		builder.WriteString(fmt.Sprintf("%s\t%d\t%.2f\t%d\t%s\t%s\n",
+			record.IP, record.LatencyMs, speedKBToMbps(record.MaxSpeed), record.MaxSpeed, record.DataCenter, record.UpdatedAt))
+	}
+	return builder.String()
 }
 
 func speedKBToMbps(speedKB int) float64 {
@@ -279,7 +434,7 @@ func formatSpeed(speedKB int) string {
 }
 
 // cloudflareTest 核心测试逻辑
-func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLatency int, expectedDataCenter string, expectedCount int, rttTestCount int, rttTestAll bool, skipIPs map[string]struct{}) []SelectionResult {
+func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLatency int, expectedDataCenter string, expectedCount int, rttTestCount int, rttTestAll bool, rttServerName string, rttTimeout time.Duration, skipIPs map[string]struct{}) []SelectionResult {
 	expectedDataCenter = strings.TrimSpace(expectedDataCenter)
 	if expectedCount <= 0 {
 		expectedCount = 1
@@ -333,7 +488,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLat
 
 			fmt.Printf("已生成 %d 个测试 IP，开始 RTT 测试...\n", len(testIPs))
 
-			rttResults = runRTTTest(testIPs, taskNum, useTLS, rttKeepCount)
+			rttResults = runRTTTest(testIPs, taskNum, useTLS, rttKeepCount, rttServerName, rttTimeout)
 			if len(rttResults) > 0 {
 				break
 			}
@@ -375,6 +530,13 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLat
 
 		neededCount := expectedCount - len(selectedResults)
 		speedResults := runSerialSpeedTests(rttResults, useTLS, speed, expectedDataCenter, selectedIPs, neededCount)
+		if len(speedResults) > 0 {
+			if err := recordValidIPs(speedResults); err != nil {
+				fmt.Println("记录本轮有效 IP 失败:", err)
+			} else {
+				fmt.Printf("本轮 %d 个有效 IP 已记录到 %s\n", len(speedResults), dataPath(validIPTextFile))
+			}
+		}
 		for _, result := range speedResults {
 			selectedResults = append(selectedResults, result)
 			selectedIPs[result.IP] = struct{}{}
@@ -388,7 +550,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, expectedLat
 }
 
 // replaceSlowestCandidates 按新延迟阈值替换当前结果中延迟最高的候选
-func replaceSlowestCandidates(ipType int, useTLS bool, taskNum int, speed int, expectedDataCenter string, results []SelectionResult, maxLatency int, rttTestCount int, rttTestAll bool) []SelectionResult {
+func replaceSlowestCandidates(ipType int, useTLS bool, taskNum int, speed int, expectedDataCenter string, results []SelectionResult, maxLatency int, rttTestCount int, rttTestAll bool, rttServerName string, rttTimeout time.Duration) []SelectionResult {
 	if len(results) == 0 {
 		return results
 	}
@@ -403,7 +565,7 @@ func replaceSlowestCandidates(ipType int, useTLS bool, taskNum int, speed int, e
 
 		worst := results[worstIndex]
 		fmt.Printf("当前最高延迟候选为 %s (%d 毫秒)，继续寻找 <= %d 毫秒的替换 IP...\n", worst.IP, worst.LatencyMs, maxLatency)
-		replacements := cloudflareTest(ipType, useTLS, taskNum, speed, maxLatency, expectedDataCenter, 1, rttTestCount, rttTestAll, skippedIPs)
+		replacements := cloudflareTest(ipType, useTLS, taskNum, speed, maxLatency, expectedDataCenter, 1, rttTestCount, rttTestAll, rttServerName, rttTimeout, skippedIPs)
 		if len(replacements) == 0 {
 			return results
 		}
@@ -609,7 +771,7 @@ type RTTResult struct {
 }
 
 // runRTTTest 运行 RTT 测试（并发，带进度显示）
-func runRTTTest(ipList []string, taskNum int, useTLS bool, keepCount int) []RTTResult {
+func runRTTTest(ipList []string, taskNum int, useTLS bool, keepCount int, rttServerName string, rttTimeout time.Duration) []RTTResult {
 	if len(ipList) < taskNum {
 		taskNum = len(ipList)
 	}
@@ -637,7 +799,7 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool, keepCount int) []RTTR
 				}
 			}()
 
-			avgMs, dc := testRTT(ip, useTLS)
+			avgMs, dc := testRTT(ip, useTLS, rttServerName, rttTimeout)
 			if avgMs > 0 {
 				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, DataCenter: dc}
 			}
@@ -673,27 +835,33 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool, keepCount int) []RTTR
 
 // testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）
 // 连续 3 次取 TCP 连接时间，取平均延迟，中间任何一次失败直接丢弃
-func testRTT(ip string, useTLS bool) (int, string) {
+func testRTT(ip string, useTLS bool, rttServerName string, rttTimeout time.Duration) (int, string) {
 	port := 80
 	if useTLS {
 		port = 443
+	}
+	if !isValidServerName(rttServerName) {
+		rttServerName = defaultRTTServerName
+	}
+	if rttTimeout < minRTTTimeout {
+		rttTimeout = minRTTTimeout
 	}
 
 	var totalMs int
 	var dataCenter string
 	for range 3 {
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), rttDialTimeout)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), rttTimeout)
 		if err != nil {
 			return 0, ""
 		}
 		tcpDuration := time.Since(start)
 
-		conn.SetDeadline(start.Add(rttAttemptTimeout))
+		conn.SetDeadline(start.Add(rttTimeout))
 
 		var rwc net.Conn = conn
 		if useTLS {
-			tlsConn := tls.Client(conn, &tls.Config{ServerName: "cloudflare.com", InsecureSkipVerify: true})
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: rttServerName, InsecureSkipVerify: true})
 			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
 				return 0, ""
@@ -701,7 +869,7 @@ func testRTT(ip string, useTLS bool) (int, string) {
 			rwc = tlsConn
 		}
 
-		reqStr := "GET / HTTP/1.1\r\nHost: cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+		reqStr := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", rttServerName)
 		_, err = rwc.Write([]byte(reqStr))
 		if err != nil {
 			rwc.Close()
@@ -942,11 +1110,33 @@ func updateData() {
 // ----------------------- 工具函数 -----------------------
 
 const (
-	rttDialTimeout    = 250 * time.Millisecond
-	rttAttemptTimeout = 250 * time.Millisecond
-	speedDialTimeout  = 800 * time.Millisecond
-	speedTestTimeout  = 4 * time.Second
+	defaultRTTServerName = "cloudflare-ech.com"
+	validIPJSONFile      = "valid-ips.json"
+	validIPTextFile      = "valid-ips.txt"
+	defaultRTTTimeout    = 250 * time.Millisecond
+	minRTTTimeout        = 100 * time.Millisecond
+	minRTTTimeoutMs      = 100
+	speedDialTimeout     = 800 * time.Millisecond
+	speedTestTimeout     = 4 * time.Second
 )
+
+func isValidServerName(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 253 || strings.ContainsAny(value, " /\\\t\r\n:") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 var (
 	dataDir         string
